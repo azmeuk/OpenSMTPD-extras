@@ -1578,6 +1578,9 @@ AC_CONFIG_FILES([Makefile
 
 		extras/Makefile
 
+		extras/filters/Makefile
+		extras/filters/filter-python/Makefile
+
 		extras/queues/Makefile
 		extras/queues/queue-null/Makefile
 		extras/queues/queue-python/Makefile
