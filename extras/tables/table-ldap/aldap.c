@@ -17,11 +17,14 @@
 
 #include "includes.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+#include <event.h>
 
 #include "aldap.h"
 
@@ -36,9 +39,13 @@ static struct ber_element	*ldap_do_parse_search_filter(
 				    struct ber_element *, char **);
 char				**aldap_get_stringset(struct ber_element *);
 char				*utoa(char *);
+static int			 isu8cont(unsigned char);
 char				*parseval(char *, size_t);
 int				aldap_create_page_control(struct ber_element *,
 				    int, struct aldap_page_control *);
+int				aldap_send(struct aldap *,
+				    struct ber_element *);
+unsigned long			aldap_application(struct ber_element *);
 
 #ifdef DEBUG
 void			 ldap_debug_elements(struct ber_element *);
@@ -52,13 +59,24 @@ void			 ldap_debug_elements(struct ber_element *);
 #define LDAP_DEBUG(x, y)	do { } while (0)
 #endif
 
+unsigned long
+aldap_application(struct ber_element *elm)
+{
+	return BER_TYPE_OCTETSTRING;
+}
+
 int
 aldap_close(struct aldap *al)
 {
-	if (close(al->ber.fd) == -1)
-		return (-1);
-
+#if HAVE_TLS_H
+	if (al->tls != NULL) {
+		tls_close(al->tls);
+		tls_free(al->tls);
+	}
+#endif
+	close(al->fd);
 	ber_free(&al->ber);
+	evbuffer_free(al->buf);
 	free(al);
 
 	return (0);
@@ -71,16 +89,115 @@ aldap_init(int fd)
 
 	if ((a = calloc(1, sizeof(*a))) == NULL)
 		return NULL;
-	a->ber.fd = fd;
+	a->buf = evbuffer_new();
+	a->fd = fd;
+	ber_set_application(&a->ber, aldap_application);
 
 	return a;
 }
+
+
+#if HAVE_TLS_H
+int
+aldap_tls(struct aldap *ldap, struct tls_config *cfg, const char *name)
+{
+	ldap->tls = tls_client();
+	if (ldap->tls == NULL) {
+		ldap->err = ALDAP_ERR_OPERATION_FAILED;
+		return (-1);
+	}
+
+	if (tls_configure(ldap->tls, cfg) == -1) {
+		ldap->err = ALDAP_ERR_TLS_ERROR;
+		return (-1);
+	}
+
+	if (tls_connect_socket(ldap->tls, ldap->fd, name) == -1) {
+		ldap->err = ALDAP_ERR_TLS_ERROR;
+		return (-1);
+	}
+
+	if (tls_handshake(ldap->tls) == -1) {
+		ldap->err = ALDAP_ERR_TLS_ERROR;
+		return (-1);
+	}
+
+	return (0);
+}
+#endif
+
+int
+aldap_send(struct aldap *ldap, struct ber_element *root)
+{
+	int error, wrote;
+	void *ptr;
+	char *data;
+	size_t len, done;
+
+	len = ber_calc_len(root);
+	error = ber_write_elements(&ldap->ber, root);
+	ber_free_elements(root);
+	if (error == -1)
+		return -1;
+
+	ber_get_writebuf(&ldap->ber, &ptr);
+	done = 0;
+	data = ptr;
+	while (len > 0) {
+#if HAVE_TLS_H
+		if (ldap->tls != NULL) {
+			wrote = tls_write(ldap->tls, data + done, len);
+			if (wrote == TLS_WANT_POLLIN ||
+			    wrote == TLS_WANT_POLLOUT)
+				continue;
+		} else
+#endif
+			wrote = write(ldap->fd, data + done, len);
+
+		if (wrote == -1)
+			return -1;
+
+		len -= wrote;
+		done += wrote;
+	}
+
+	return 0;
+}
+
+#if HAVE_TLS_H
+int
+aldap_req_starttls(struct aldap *ldap)
+{
+	struct ber_element *root = NULL, *ber;
+
+	if ((root = ber_add_sequence(NULL)) == NULL)
+		goto fail;
+
+	ber = ber_printf_elements(root, "d{tst", ++ldap->msgid, BER_CLASS_APP,
+	    (unsigned long) LDAP_REQ_EXTENDED, LDAP_STARTTLS_OID,
+	    BER_CLASS_CONTEXT, (unsigned long) 0);
+	if (ber == NULL) {
+		ldap->err = ALDAP_ERR_OPERATION_FAILED;
+		goto fail;
+	}
+
+	if (aldap_send(ldap, root) == -1)
+		goto fail;
+
+	return (ldap->msgid);
+fail:
+	if (root != NULL)
+		ber_free_elements(root);
+
+	ldap->err = ALDAP_ERR_OPERATION_FAILED;
+	return (-1);
+}
+#endif
 
 int
 aldap_bind(struct aldap *ldap, char *binddn, char *bindcred)
 {
 	struct ber_element *root = NULL, *elm;
-	int error;
 
 	if (binddn == NULL)
 		binddn = "";
@@ -98,12 +215,10 @@ aldap_bind(struct aldap *ldap, char *binddn, char *bindcred)
 
 	LDAP_DEBUG("aldap_bind", root);
 
-	error = ber_write_elements(&ldap->ber, root);
-	ber_free_elements(root);
-	root = NULL;
-	if (error == -1)
+	if (aldap_send(ldap, root) == -1) {
+		root = NULL;
 		goto fail;
-
+	}
 	return (ldap->msgid);
 fail:
 	if (root != NULL)
@@ -117,7 +232,6 @@ int
 aldap_unbind(struct aldap *ldap)
 {
 	struct ber_element *root = NULL, *elm;
-	int error;
 
 	if ((root = ber_add_sequence(NULL)) == NULL)
 		goto fail;
@@ -128,12 +242,10 @@ aldap_unbind(struct aldap *ldap)
 
 	LDAP_DEBUG("aldap_unbind", root);
 
-	error = ber_write_elements(&ldap->ber, root);
-	ber_free_elements(root);
-	root = NULL;
-	if (error == -1)
+	if (aldap_send(ldap, root) == -1) {
+		root = NULL;
 		goto fail;
-
+	}
 	return (ldap->msgid);
 fail:
 	if (root != NULL)
@@ -150,7 +262,7 @@ aldap_search(struct aldap *ldap, char *basedn, enum scope scope, char *filter,
     struct aldap_page_control *page)
 {
 	struct ber_element *root = NULL, *ber, *c;
-	int i, error;
+	int i;
 
 	if ((root = ber_add_sequence(NULL)) == NULL)
 		goto fail;
@@ -188,10 +300,8 @@ aldap_search(struct aldap *ldap, char *basedn, enum scope scope, char *filter,
 
 	LDAP_DEBUG("aldap_search", root);
 
-	error = ber_write_elements(&ldap->ber, root);
-	ber_free_elements(root);
-	root = NULL;
-	if (error == -1) {
+	if (aldap_send(ldap, root) == -1) {
+		root = NULL;
 		ldap->err = ALDAP_ERR_OPERATION_FAILED;
 		goto fail;
 	}
@@ -214,7 +324,6 @@ aldap_create_page_control(struct ber_element *elm, int size,
 	struct ber_element *ber = NULL;
 
 	c.br_wbuf = NULL;
-	c.fd = -1;
 
 	ber = ber_add_sequence(NULL);
 
@@ -252,12 +361,46 @@ aldap_parse(struct aldap *ldap)
 	long long		 msgid = 0;
 	struct aldap_message	*m;
 	struct ber_element	*a = NULL, *ep;
+	char			 rbuf[512];
+	int			 ret, retry;
 
 	if ((m = calloc(1, sizeof(struct aldap_message))) == NULL)
 		return NULL;
 
-	if ((m->msg = ber_read_elements(&ldap->ber, NULL)) == NULL)
-		goto parsefail;
+	retry = 0;
+	while (m->msg == NULL) {
+		if (retry || EVBUFFER_LENGTH(ldap->buf) == 0) {
+#if HAVE_TLS_H
+			if (ldap->tls) {
+				ret = tls_read(ldap->tls, rbuf, sizeof(rbuf));
+				if (ret == TLS_WANT_POLLIN ||
+				    ret == TLS_WANT_POLLOUT)
+					continue;
+			} else
+#endif
+				ret = read(ldap->fd, rbuf, sizeof(rbuf));
+
+			if (ret == -1) {
+				goto parsefail;
+			}
+
+			evbuffer_add(ldap->buf, rbuf, ret);
+		}
+
+		if (EVBUFFER_LENGTH(ldap->buf) > 0) {
+			ber_set_readbuf(&ldap->ber, EVBUFFER_DATA(ldap->buf),
+			    EVBUFFER_LENGTH(ldap->buf));
+			errno = 0;
+			m->msg = ber_read_elements(&ldap->ber, NULL);
+			if (errno != 0 && errno != ECANCELED) {
+				goto parsefail;
+			}
+
+			retry = 1;
+		}
+	}
+
+	evbuffer_drain(ldap->buf, ldap->ber.br_rptr - ldap->ber.br_rbuf);
 
 	LDAP_DEBUG("message", m->msg);
 
@@ -300,10 +443,17 @@ aldap_parse(struct aldap *ldap)
 		if (ber_scanf_elements(m->protocol_op, "{e", &m->references) != 0)
 			goto parsefail;
 		break;
+	case LDAP_RES_EXTENDED:
+		if (ber_scanf_elements(m->protocol_op, "{E",
+		    &m->body.res.rescode) != 0) {
+			goto parsefail;
+		}
+		break;
 	}
 
 	return m;
 parsefail:
+	evbuffer_drain(ldap->buf, EVBUFFER_LENGTH(ldap->buf));
 	ldap->err = ALDAP_ERR_PARSER_ERROR;
 	aldap_freemsg(m);
 	return NULL;
@@ -319,17 +469,13 @@ aldap_parse_page_control(struct ber_element *control, size_t len)
 	struct aldap_page_control *page;
 
 	b.br_wbuf = NULL;
-	b.fd = -1;
 	ber_scanf_elements(control, "ss", &oid, &encoded);
 	ber_set_readbuf(&b, encoded, control->be_next->be_len);
 	elm = ber_read_elements(&b, NULL);
-	if (elm == NULL) {
-		ber_free(&b);
-		return NULL;
-	}
 
 	if ((page = malloc(sizeof(struct aldap_page_control))) == NULL) {
-		ber_free_elements(elm);
+		if (elm != NULL)
+			ber_free_elements(elm);
 		ber_free(&b);
 		return NULL;
 	}
@@ -338,7 +484,8 @@ aldap_parse_page_control(struct ber_element *control, size_t len)
 	page->cookie_len = elm->be_sub->be_next->be_len;
 
 	if ((page->cookie = malloc(page->cookie_len)) == NULL) {
-		ber_free_elements(elm);
+		if (elm != NULL)
+			ber_free_elements(elm);
 		ber_free(&b);
 		free(page);
 		return NULL;
@@ -353,8 +500,7 @@ aldap_parse_page_control(struct ber_element *control, size_t len)
 void
 aldap_freepage(struct aldap_page_control *page)
 {
-	if (page->cookie)
-		free(page->cookie);
+	free(page->cookie);
 	free(page);
 }
 
@@ -560,25 +706,37 @@ void
 aldap_free_url(struct aldap_url *lu)
 {
 	free(lu->buffer);
-	free(lu->filter);
 }
 
 int
-aldap_parse_url(char *url, struct aldap_url *lu)
+aldap_parse_url(const char *url, struct aldap_url *lu)
 {
 	char		*p, *forward, *forward2;
 	const char	*errstr = NULL;
 	int		 i;
 
-	if ((lu->buffer = strdup(url)) == NULL)
+	if ((lu->buffer = p = strdup(url)) == NULL)
 		return (-1);
-	p = lu->buffer;
 
 	/* protocol */
-	if (strncasecmp(LDAP_URL, p, strlen(LDAP_URL)) != 0)
-		goto fail;
-	lu->protocol = LDAP;
-	p += strlen(LDAP_URL);
+	if (strncasecmp(LDAP_URL, p, strlen(LDAP_URL)) == 0) {
+		lu->protocol = LDAP;
+        lu->port = LDAP_PORT;
+		p += strlen(LDAP_URL);
+	} else if (strncasecmp(LDAPS_URL, p, strlen(LDAPS_URL)) == 0) {
+		lu->protocol = LDAPS;
+        lu->port = LDAPS_PORT;
+		p += strlen(LDAPS_URL);
+#if HAVE_TLS_H
+	} else if (strncasecmp(LDAPTLS_URL, p, strlen(LDAPTLS_URL)) == 0) {
+		lu->protocol = LDAPTLS;
+		p += strlen(LDAPTLS_URL);
+#endif
+	} else if (strncasecmp(LDAPI_URL, p, strlen(LDAPI_URL)) == 0) {
+		lu->protocol = LDAPI;
+		p += strlen(LDAPI_URL);
+	} else
+		lu->protocol = -1;
 
 	/* host and optional port */
 	if ((forward = strchr(p, '/')) != NULL)
@@ -593,8 +751,6 @@ aldap_parse_url(char *url, struct aldap_url *lu)
 			if (errstr)
 				goto fail;
 		}
-	} else {
-		lu->port = LDAP_PORT;
 	}
 	/* fail if no host is given */
 	if (strlen(p) == 0)
@@ -660,7 +816,6 @@ aldap_parse_url(char *url, struct aldap_url *lu)
 	if (p)
 		lu->filter = p;
 done:
-	free(url);
 	return (1);
 fail:
 	free(lu->buffer);
@@ -668,10 +823,9 @@ fail:
 	return (-1);
 }
 
-#if 0
 int
 aldap_search_url(struct aldap *ldap, char *url, int typesonly, int sizelimit,
-    int timelimit)
+    int timelimit, struct aldap_page_control *page)
 {
 	struct aldap_url *lu;
 
@@ -682,7 +836,7 @@ aldap_search_url(struct aldap *ldap, char *url, int typesonly, int sizelimit,
 		goto fail;
 
 	if (aldap_search(ldap, lu->dn, lu->scope, lu->filter, lu->attributes,
-	    typesonly, sizelimit, timelimit) == -1)
+	    typesonly, sizelimit, timelimit, page) == -1)
 		goto fail;
 
 	aldap_free_url(lu);
@@ -691,7 +845,6 @@ fail:
 	aldap_free_url(lu);
 	return (-1);
 }
-#endif
 
 /*
  * internal functions
@@ -824,7 +977,7 @@ ldap_do_parse_search_filter(struct ber_element *prev, char **cpp)
 		ber_set_header(root, BER_CLASS_CONTEXT, LDAP_FILT_NOT);
 
 		cp++;				/* now points to sub-filter */
-		if (ldap_do_parse_search_filter(root, &cp) == NULL)
+		if ((elm = ldap_do_parse_search_filter(root, &cp)) == NULL)
 			goto bad;
 
 		if (*cp != ')')			/* trailing `)` of filter */
@@ -966,7 +1119,7 @@ ldap_debug_elements(struct ber_element *root)
 	int		 d;
 	char		*buf;
 	size_t		 len;
-	unsigned int	 i;
+	u_int		 i;
 	int		 constructed;
 	struct ber_oid	 o;
 
@@ -1165,7 +1318,7 @@ ldap_debug_elements(struct ber_element *root)
 #endif
 
 /*
- * Convert UTF-8 to ASCII.
+ * Strip UTF-8 down to ASCII without validation.
  * notes:
  *	non-ASCII characters are displayed as '?'
  *	the argument u should be a NULL terminated sequence of UTF-8 bytes.
@@ -1177,74 +1330,49 @@ utoa(char *u)
 	char	*str;
 
 	/* calculate the length to allocate */
-	for (len = 0, i = 0; u[i] != '\0'; ) {
-		if ((u[i] & 0xF0) == 0xF0)
-			i += 4;
-		else if ((u[i] & 0xE0) == 0xE0)
-			i += 3;
-		else if ((u[i] & 0xC0) == 0xC0)
-			i += 2;
-		else
-			i += 1;
-		len++;
-	}
+	for (len = 0, i = 0; u[i] != '\0'; i++)
+		if (!isu8cont(u[i]))
+			len++;
 
 	if ((str = calloc(len + 1, sizeof(char))) == NULL)
 		return NULL;
 
 	/* copy the ASCII characters to the newly allocated string */
-	for (i = 0, j = 0; u[i] != '\0'; j++) {
-		if ((u[i] & 0xF0) == 0xF0) {
-			str[j] = '?';
-			i += 4;
-		} else if ((u[i] & 0xE0) == 0xE0) {
-			str[j] = '?';
-			i += 3;
-		} else if ((u[i] & 0xC0) == 0xC0) {
-			str[j] = '?';
-			i += 2;
-		} else {
-			str[j] =  u[i];
-			i += 1;
-		}
-	}
+	for (i = 0, j = 0; u[i] != '\0'; i++)
+		if (!isu8cont(u[i]))
+			str[j++] = isascii((unsigned char)u[i]) ? u[i] : '?';
 
 	return str;
+}
+
+static int
+isu8cont(unsigned char c)
+{
+	return (c & (0x80 | 0x40)) == 0x80;
 }
 
 /*
  * Parse a LDAP value
  * notes:
- *	the argument u should be a NULL terminated sequence of ASCII bytes.
+ *	the argument p should be a NUL-terminated sequence of ASCII bytes
  */
 char *
 parseval(char *p, size_t len)
 {
 	char	 hex[3];
-	char	*cp = p, *buffer, *newbuffer;
-	size_t	 size, newsize, i, j;
+	char	*buffer;
+	size_t	 i, j;
 
-	size = 50;
-	if ((buffer = calloc(1, size)) == NULL)
+	if ((buffer = calloc(1, len + 1)) == NULL)
 		return NULL;
 
 	for (i = j = 0; j < len; i++) {
-		if (i >= size) {
-			newsize = size + 1024;
-			if ((newbuffer = realloc(buffer, newsize)) == NULL) {
-				free(buffer);
-				return (NULL);
-			}
-			buffer = newbuffer;
-			size = newsize;
-		}
-
-		if (cp[j] == '\\') {
-			(void)strlcpy(hex, cp + j + 1, sizeof(hex));
+		if (p[j] == '\\') {
+			strlcpy(hex, p + j + 1, sizeof(hex));
 			buffer[i] = (char)strtoumax(hex, NULL, 16);
 			j += 3;
 		} else {
-			buffer[i] = cp[j];
+			buffer[i] = p[j];
 			j++;
 		}
 	}
@@ -1268,6 +1396,11 @@ aldap_get_errno(struct aldap *a, const char **estr)
 	case ALDAP_ERR_OPERATION_FAILED:
 		*estr = "operation failed";
 		break;
+#if HAVE_TLS_H
+	case ALDAP_ERR_TLS_ERROR:
+		*estr = tls_error(a->tls);
+		break;
+#endif
 	default:
 		*estr = "unknown";
 		break;

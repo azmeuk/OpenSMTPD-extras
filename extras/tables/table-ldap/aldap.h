@@ -16,20 +16,38 @@
  */
 
 #include <stdio.h>
+
+#if HAVE_TLS_H
+#include <tls.h>
+#endif
+
 #include "ber.h"
 
-#define LDAP_URL "ldap://"
-#define LDAP_PORT 389
-#define LDAP_PAGED_OID  "1.2.840.113556.1.4.319"
+#define LDAP_URL 		"ldap://"
+#define LDAPS_URL 		"ldaps://"
+#define LDAPTLS_URL 	"ldap+tls://"
+#define LDAPI_URL 		"ldapi://"
+
+#define LDAP_PORT 		389
+#define LDAPS_PORT 		636
+#define LDAP_PAGED_OID		"1.2.840.113556.1.4.319"
+#define LDAP_STARTTLS_OID	"1.3.6.1.4.1.1466.20037"
 
 struct aldap {
 #define ALDAP_ERR_SUCCESS		0
 #define ALDAP_ERR_PARSER_ERROR		1
 #define ALDAP_ERR_INVALID_FILTER	2
 #define ALDAP_ERR_OPERATION_FAILED	3
-	uint8_t		err;
+#define ALDAP_ERR_TLS_ERROR		4
+	u_int8_t	err;
 	int		msgid;
 	struct ber	ber;
+
+	int		fd;
+
+	struct tls	*tls;
+
+	struct evbuffer *buf;
 };
 
 struct aldap_page_control {
@@ -65,7 +83,9 @@ struct aldap_message {
 
 enum aldap_protocol {
 	LDAP,
-	LDAPS
+	LDAPS,
+	LDAPTLS,
+	LDAPI
 };
 
 struct aldap_url {
@@ -100,6 +120,9 @@ enum protocol_op {
 	LDAP_REQ_ABANDON_30	= 16,
 
 	LDAP_RES_SEARCH_REFERENCE = 19,
+
+	LDAP_REQ_EXTENDED	= 23,
+	LDAP_RES_EXTENDED	= 24
 };
 
 enum deref_aliases {
@@ -168,7 +191,7 @@ enum result_code {
 	LDAP_OTHER				= 80,
 };
 
-enum ldap_filter {
+enum filter {
 	LDAP_FILT_AND		= 0,
 	LDAP_FILT_OR		= 1,
 	LDAP_FILT_NOT		= 2,
@@ -180,16 +203,25 @@ enum ldap_filter {
 	LDAP_FILT_APPR		= 8,
 };
 
-enum ldap_subfilter {
+enum subfilter {
 	LDAP_FILT_SUBS_INIT	= 0,
 	LDAP_FILT_SUBS_ANY	= 1,
 	LDAP_FILT_SUBS_FIN	= 2,
 };
 
-struct aldap		*aldap_init(int fd);
+struct aldap		*aldap_init(int);
+
+#if HAVE_TLS_H
+int			 aldap_tls(struct aldap *, struct tls_config *,
+			    const char *);
+#endif
 int			 aldap_close(struct aldap *);
 struct aldap_message	*aldap_parse(struct aldap *);
 void			 aldap_freemsg(struct aldap_message *);
+
+#if HAVE_TLS_H
+int	 		 aldap_req_starttls(struct aldap *);
+#endif
 
 int	 aldap_bind(struct aldap *, char *, char *);
 int	 aldap_unbind(struct aldap *);
@@ -201,11 +233,10 @@ char	*aldap_get_dn(struct aldap_message *);
 char	*aldap_get_diagmsg(struct aldap_message *);
 char	**aldap_get_references(struct aldap_message *);
 void	 aldap_free_references(char **values);
-int	 aldap_parse_url(char *, struct aldap_url *);
+int	 aldap_parse_url(const char *, struct aldap_url *);
 void	 aldap_free_url(struct aldap_url *);
-#if 0
-int	 aldap_search_url(struct aldap *, char *, int, int, int);
-#endif
+int	 aldap_search_url(struct aldap *, char *, int, int, int,
+	    struct aldap_page_control *);
 
 int	 aldap_count_attrs(struct aldap_message *);
 int	 aldap_match_attr(struct aldap_message *, char *, char ***);
